@@ -3,17 +3,13 @@ package server
 import (
 	"context"
 	"fmt"
-	"net/http"
-	"strings"
+	"net"
 	"time"
 
-	adapters "github.com/NBN23dev/gcr-go-template/internal/adapters/grpc"
-	"github.com/NBN23dev/gcr-go-template/internal/adapters/grpc/server/interceptors"
-	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
+	v1 "github.com/ZonyxNagi/proto-zonyx-core/pkg/api/v1"
+	adapters "github.com/ZonyxNagi/zonyx-core/internal/adapters/grpc"
+	"github.com/ZonyxNagi/zonyx-core/internal/adapters/grpc/server/interceptors"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 	health "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/reflection"
@@ -24,25 +20,10 @@ type Server struct {
 	hc *HealhCheck
 }
 
-// grpcHandler returns an http.Handler that delegates to grpcServer on incoming gRPC
-func grpcHandler(grpcServer *grpc.Server, httpHandler http.Handler) http.Handler {
-	return h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.ProtoMajor == 2 && strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc") {
-			grpcServer.ServeHTTP(w, r)
-
-			return
-		}
-
-		if r.Method == "OPTIONS" {
-			return
-		}
-
-		httpHandler.ServeHTTP(w, r)
-	}), &http2.Server{})
-}
-
-// NewServer
-func NewServer(adapter *adapters.GRPCAdapter) (*Server, error) {
+// NewServer constructs the gRPC server and registers the CoreService (which
+// exposes both the Subscribe and Publish RPCs) along with the gRPC health
+// check and reflection.
+func NewServer(core *adapters.CoreAdapter) (*Server, error) {
 	// Create a new grpc server
 	srv := grpc.NewServer([]grpc.ServerOption{
 		grpc.ConnectionTimeout(10 * time.Second),
@@ -51,13 +32,13 @@ func NewServer(adapter *adapters.GRPCAdapter) (*Server, error) {
 			PermitWithoutStream: false,
 		}),
 		grpc.ChainStreamInterceptor(
-			interceptors.MonitorStream,
+			interceptors.ValidateStream(),
+			interceptors.MonitorStream(),
 		),
 	}...)
 
 	// Register rpc's
-	// TODO: Register GRPC service
-	// pb.RegisterPublishServiceServer(srv, adapter)
+	v1.RegisterCoreServiceServer(srv, core)
 
 	// Health check
 	hc := NewHealhCheck()
@@ -76,49 +57,12 @@ func (srv *Server) Start(port int) error {
 
 	defer cancel()
 
-	opts := []grpc.DialOption{
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
-	}
-
-	conn, err := grpc.NewClient(fmt.Sprintf("localhost:%d", port), opts...)
+	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
 		return err
 	}
 
-	mux := runtime.NewServeMux(
-		runtime.WithErrorHandler(UnaryErrorHandler),
-		runtime.WithHealthEndpointAt(health.NewHealthClient(conn), "/"),
-		runtime.WithIncomingHeaderMatcher(func(header string) (string, bool) {
-			if strings.EqualFold(header, "traceparent") {
-				return header, true
-			}
-
-			return "", false
-		}),
-		runtime.WithOutgoingHeaderMatcher(func(header string) (string, bool) {
-			if strings.EqualFold(header, "trailer") {
-				return "", false
-			}
-
-			return header, true
-		}),
-	)
-
-	// Register rpc's handler
-	// TODO: Register GRPC service
-	// ctx, cancel := context.WithCancel(context.Background())
-	// defer cancel()
-
-	// err = pb.Register${ServiceName}ServiceHandler(ctx, mux, conn)
-	// if err != nil {
-	// 	return err
-	// }
-
-	// GRPC
-	handler := grpcHandler(srv.gs, mux)
-
-	return http.ListenAndServe(fmt.Sprintf(":%d", port), handler)
+	return srv.gs.Serve(lis)
 }
 
 // Stop shutdown the server gracefully.

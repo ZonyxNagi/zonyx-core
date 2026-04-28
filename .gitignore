@@ -1,7 +1,9 @@
 .DS_Store
 .vscode
+.claude
 
 .env
+*.test
 tmp
 local
 testdata

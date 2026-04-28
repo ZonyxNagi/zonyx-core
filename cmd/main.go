@@ -2,91 +2,126 @@ package main
 
 import (
 	"context"
-	"fmt"
-	"log"
+	"errors"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
-	adapters "github.com/NBN23dev/gcr-go-template/internal/adapters/grpc"
-	"github.com/NBN23dev/gcr-go-template/internal/adapters/grpc/server"
-	"github.com/NBN23dev/gcr-go-template/internal/core/services"
-	"github.com/NBN23dev/gcr-go-template/internal/helpers"
-	"github.com/NBN23dev/gcr-go-template/internal/repositories"
-	"github.com/NBN23dev/lib-monitoring/logger"
-	"github.com/NBN23dev/lib-monitoring/tracer"
+	adapters "github.com/ZonyxNagi/zonyx-core/internal/adapters/grpc"
+	"github.com/ZonyxNagi/zonyx-core/internal/adapters/grpc/server"
+	"github.com/ZonyxNagi/zonyx-core/internal/adapters/quuppa"
+	"github.com/ZonyxNagi/zonyx-core/internal/core/ports"
+	"github.com/ZonyxNagi/zonyx-core/internal/core/services"
+	"github.com/ZonyxNagi/zonyx-core/internal/helpers"
+	"github.com/ZonyxNagi/zonyx-core/internal/repositories/jetstream"
+	"github.com/nats-io/nats.go"
+	"golang.org/x/sync/errgroup"
 )
 
-// gracefulShutdown is a function that allows to shutdown the instance gracefully
-func gracefulShutdown(callback func(os.Signal)) {
-	done := make(chan os.Signal, 1)
-
-	signal.Notify(done, os.Interrupt, syscall.SIGTERM)
-
-	sig := <-done
-
-	<-time.After(30 * time.Second)
-
-	callback(sig)
-}
-
 func main() {
-	// Context
-	ctx := context.Background()
+	// ---- config ------------------------------------------------------------
 
-	// Service name
 	name, _ := helpers.GetEnvOr("SERVICE_NAME", "unknown")
+	port, _ := helpers.GetEnvOr("PORT", 8080)
+	quuppaAddr, _ := helpers.GetEnvOr("QUUPPA_LISTEN_ADDR", ":9090")
+	natsURL, _ := helpers.GetEnvOr("NATS_URL", "nats://localhost:4222")
 
-	// Logger
-	logLevel, _ := helpers.GetEnvOr("LOG_LEVEL", logger.LevelInfo.String())
+	// ---- logger ------------------------------------------------------------
 
-	if err := logger.Init(ctx, name, logger.LevelFrom(logLevel)); err != nil {
-		log.Fatal(err)
-	}
+	var level slog.Level
+	_ = level.UnmarshalText([]byte(os.Getenv("LOG_LEVEL")))
 
-	// Tracer
-	if err := tracer.Init(ctx, name); err != nil {
-		logger.Fatal(ctx, err)
-	}
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: level,
+	}))
+	slog.SetDefault(logger)
 
-	// Repositories
-	repos, err := repositories.NewRepository()
+	// ---- root context tied to OS signals -----------------------------------
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// ---- composition -------------------------------------------------------
+
+	nc, err := nats.Connect(natsURL, nats.MaxReconnects(-1))
 	if err != nil {
-		logger.Fatal(ctx, err)
+		logger.Error("connect to NATS", slog.String("url", natsURL), slog.Any("err", err))
+		os.Exit(1)
 	}
 
-	// Service
-	service, err := services.NewService(repos)
+	repo, err := jetstream.NewRepository(nc, jetstream.Config{}, logger.With(slog.String("component", "repository")))
 	if err != nil {
-		logger.Fatal(ctx, err)
+		logger.Error("init repository", slog.Any("err", err))
+		nc.Close()
+		os.Exit(1)
 	}
 
-	// Adapter
-	adapter := adapters.NewGRPCAdapter(service)
+	providers := []ports.Provider{
+		quuppa.New(quuppaAddr, logger.With(slog.String("provider", "quuppa"))),
+	}
 
-	// Create server
-	server, err := server.NewServer(adapter)
+	service, err := services.NewService(providers, repo, logger)
 	if err != nil {
-		logger.Fatal(ctx, err)
+		logger.Error("init service", slog.Any("err", err))
+		nc.Close()
+		os.Exit(1)
 	}
 
-	// Shutdown
-	go gracefulShutdown(func(sig os.Signal) {
-		server.Stop()
+	core, err := adapters.NewCoreAdapter(service)
+	if err != nil {
+		logger.Error("init core adapter", slog.Any("err", err))
+		nc.Close()
+		os.Exit(1)
+	}
 
-		tracer.Shutdown(ctx)
+	srv, err := server.NewServer(core)
+	if err != nil {
+		logger.Error("init grpc server", slog.Any("err", err))
+		nc.Close()
+		os.Exit(1)
+	}
 
-		logger.Info(ctx, fmt.Sprintf("'%s' service it is about to end", name), nil)
+	// ---- run all components in parallel; first error cancels everyone ------
+
+	logger.Info("starting",
+		slog.String("service", name),
+		slog.Int("port", port),
+		slog.String("quuppa_addr", quuppaAddr),
+		slog.String("nats_url", natsURL),
+	)
+
+	g, gctx := errgroup.WithContext(ctx)
+
+	// Drive QUUPPA (and any future provider) lifecycles.
+	g.Go(func() error {
+		err := service.Start(gctx)
+		if errors.Is(err, context.Canceled) {
+			return nil
+		}
+		return err
 	})
 
-	logger.Info(ctx, fmt.Sprintf("'%s' service it is about to start", name), nil)
+	// gRPC server. srv.Start blocks until srv.Stop is called.
+	g.Go(func() error {
+		return srv.Start(port)
+	})
 
-	// Start server
-	port, _ := helpers.GetEnvOr("PORT", 8080)
+	// Tear-down goroutine: wait for either ctx cancellation (signal) or any
+	// errgroup goroutine returning an error (gctx will cancel), then stop
+	// the gRPC server and drain NATS gracefully.
+	g.Go(func() error {
+		<-gctx.Done()
+		logger.Info("shutdown signal received, stopping gracefully", slog.String("service", name))
+		srv.Stop()
+		nc.Drain() //nolint:errcheck
+		return nil
+	})
 
-	err = server.Start(port)
-	if err != nil {
-		logger.Fatal(ctx, err)
+	if err := g.Wait(); err != nil && !errors.Is(err, context.Canceled) {
+		logger.Error("shutdown with error", slog.Any("err", err))
+		os.Exit(1)
 	}
+
+	logger.Info("stopped cleanly", slog.String("service", name))
 }

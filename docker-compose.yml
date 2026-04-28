@@ -1,0 +1,56 @@
+services:
+
+  # ---------------------------------------------------------------------------
+  # NATS JetStream — durable event store
+  # ---------------------------------------------------------------------------
+  nats:
+    image: nats:2-alpine
+    restart: unless-stopped
+    command: [ "-js", "-m", "8222", "-sd", "/data" ]
+    ports:
+      - "4222:4222" # client connections
+      - "8222:8222" # HTTP monitoring
+    volumes:
+      - nats-data:/data
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "--no-verbose",
+          "--tries=1",
+          "--spider",
+          "http://localhost:8222/healthz",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  # ---------------------------------------------------------------------------
+  # zonyx-core — gRPC dispatcher
+  # ---------------------------------------------------------------------------
+  zonyx-core:
+    build:
+      context: .
+      dockerfile: build/package/Dockerfile
+      ssh:
+        - default
+    restart: on-failure
+    env_file: .env
+    environment:
+      # Override the localhost default from .env with the compose service name.
+      NATS_URL: nats://nats:4222
+    ports:
+      - "${PORT:-8080}:${PORT:-8080}" # gRPC
+      - "9090:9090/udp" # QUUPPA UDP listener
+    # To maximise UDP receive-buffer size on a native Linux host, set
+    # net.core.rmem_max at the host level (e.g. /etc/sysctl.d/) or via
+    # `docker run --sysctl net.core.rmem_max=8388608`. Docker Desktop for
+    # Mac does not allow setting these sysctls from compose.
+    depends_on:
+      nats:
+        condition: service_healthy
+
+volumes:
+  nats-data:
